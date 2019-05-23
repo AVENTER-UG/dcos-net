@@ -2,6 +2,12 @@
 
 set -uo pipefail
 
+usage() {
+  echo "usage: $SCRIPT"
+  echo
+  echo "a networking helper for troubleshooting and collecting diagnostics data"
+}
+
 SCRIPT="$0"
 NARGS="$#"
 
@@ -16,16 +22,6 @@ fi
 if [ -z "${DCOS_VERSION+x}" ]; then
   exec /opt/mesosphere/bin/dcos-shell "$SCRIPT"
 fi
-
-usage() {
-  echo "usage: $SCRIPT"
-  echo
-  echo "a networking helper for troubleshooting and collecting diagnostics data"
-  echo
-  echo "available commands:"
-  echo "    remote-host              check connectivity to a remote host"
-  echo "    data                     collect diagnostics data"
-}
 
 IP="$(/opt/mesosphere/bin/detect_ip)"
 DATA_DIR="data-$IP"
@@ -47,12 +43,14 @@ running-on-master() {
 
 RUNNING_ON_MASTER="$(running-on-master)"
 
-if docker pull mesosphere/net-toolbox; then
-  USE_NET_TOOLBOX="true"
-else
-  echo "*WARNING* could not download mesosphere/net-toolbox docker image"
-  echo "*WARNING* the ipvsadm command must be installed before collection"
-  echo "*WARNING* will succeed."
+USE_NET_TOOLBOX=${USE_NET_TOOLBOX:-true}
+if [ "$USE_NET_TOOLBOX" == "true" ]; then
+  if ! docker pull mesosphere/net-toolbox; then
+    USE_NET_TOOLBOX="false"
+    echo "*WARNING* could not download mesosphere/net-toolbox docker image"
+    echo "*WARNING* the ipvsadm command must be installed before collection"
+    echo "*WARNING* will succeed."
+  fi
 fi
 
 wrap-curl() {
@@ -60,15 +58,19 @@ wrap-curl() {
 }
 
 wrap-ipvsadm() {
-    if [ -z "${USE_NET_TOOLBOX}" ]; then
-        ipvsadm "$@"
+  if [ "${USE_NET_TOOLBOX}" == "false" ]; then
+    if type ipvsadm &> /dev/null; then
+      ipvsadm "$@"
     else
-        docker run \
-            --rm \
-            --net=host \
-            --privileged \
-            mesosphere/net-toolbox:latest ipvsadm "$@"
+      echo "ipvsadm is not available"
     fi
+  else
+    docker run \
+           --rm \
+           --net=host \
+           --privileged \
+           mesosphere/net-toolbox:latest ipvsadm "$@"
+  fi
 }
 
 wrap-net-eval() {
@@ -83,7 +85,9 @@ dcos-version() {
   echo "======================================================================"
   (
     echo "DC/OS $DCOS_VERSION";
-    echo "Variant: $DCOS_VARIANT";
+    if [ ! -z "${DCOS_VARIANT+x}" ]; then
+      echo "Variant: $DCOS_VARIANT";
+    fi
     echo "Image commit: $DCOS_IMAGE_COMMIT"
   ) | tee "$DATA_DIR/dcos-version.txt"
   echo
@@ -234,12 +238,12 @@ overlay-data() {
     > "$DATA_DIR/lashup-overlays.txt"
 
   echo "Capturing Mesos overlay information..."
-  if [ "x$RUNNING_ON_MASTER" == "xyes" ];then
+  if [ "$RUNNING_ON_MASTER" == "yes" ];then
     wrap-curl \
-      "https://$IP:5050/overlay-master/state" > "$DATA_DIR/overlay-info.txt"
+      "https://$IP:5050/overlay-master/state" > "$DATA_DIR/overlay-master-state.json" | jq .
   else
     wrap-curl \
-      "https://$IP:5051/overlay-agent/overlay" > "$DATA_DIR/overlay-info.txt"
+      "https://$IP:5051/overlay-agent/overlay" > "$DATA_DIR/overlay-agent-state.json" | jq .
   fi
 
   echo "Captured overlay data"
@@ -287,7 +291,8 @@ dns-data() {
 
 # dig <yourapp>.<yourframework>.mesos @127.0.0.1 -p 61053
 
-mkdir $DATA_DIR
+mkdir "$DATA_DIR"
+
 dcos-version
 os-data
 logs
@@ -296,3 +301,7 @@ mesos-state
 l4lb-data
 overlay-data
 dns-data
+
+chmod 644 "$DATA_DIR"/*
+tar czf "$DATA_DIR.tar.gz" "$DATA_DIR"
+rm -Rf "$DATA_DIR"
